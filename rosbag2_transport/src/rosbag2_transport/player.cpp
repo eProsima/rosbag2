@@ -744,8 +744,10 @@ bool PlayerImpl::play_next()
 
   // Wait for play next to be done, and then return the result
   std::unique_lock<std::mutex> lk(finished_play_next_mutex_);
-  // Wake up the clock in case it's in a sleep_until(time) call
-  clock_->wakeup();
+  // Temporarily resume clock to force wakeup in clock_->sleep_until(time),
+  // then return in pause mode to preserve original state of the player
+  clock_->resume();
+  clock_->pause();
   finished_play_next_ = false;
   finished_play_next_cv_.wait(lk, [this] {return finished_play_next_.load();});
   play_next_ = false;
@@ -1025,11 +1027,14 @@ void PlayerImpl::play_messages_from_queue()
         // If we tried to publish because of play_next(), jump the clock
         if (play_next_.load()) {
           clock_->jump(message_ptr->recv_timestamp);
-          play_next_ = false;
-          std::lock_guard<std::mutex> lk(finished_play_next_mutex_);
-          finished_play_next_ = true;
-          play_next_result_ = message_published;
-          finished_play_next_cv_.notify_all();
+          // If we successfully played next, notify that we're done, otherwise keep trying
+          if (message_published) {
+            play_next_ = false;
+            std::lock_guard<std::mutex> lk(finished_play_next_mutex_);
+            finished_play_next_ = true;
+            play_next_result_ = true;
+            finished_play_next_cv_.notify_all();
+          }
         }
       }
       message_ptr = take_next_message_from_queue();
@@ -1051,8 +1056,9 @@ void PlayerImpl::play_messages_from_queue()
     while (!stop_playback_ && is_paused() && !play_next_.load() && rclcpp::ok()) {
       clock_->sleep_until(clock_->now());
     }
-    // If we ran out of messages and are not in pause state, it means we're done playing
-    if (!is_paused()) {
+    // If we ran out of messages and are not in pause state, it means we're done playing,
+    // unless play_next() is resuming and pausing the clock in order to wake us up
+    if (!is_paused() && !play_next_.load()) {
       break;
     }
 
